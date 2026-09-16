@@ -256,8 +256,11 @@ Capabilities parseAbility(const Json &value)
         c.audio = capVer(chn, "supportAudio") || capVer(chn, "supportGop");
         c.talk = capVer(chn, "talk"); // per-channel (verified on RLN8-410)
         c.siren = capVer(chn, "supportAudioAlarm") || capVer(chn, "alarmAudio");
-        c.floodlight = capVer(chn, "floodLight") || capVer(chn, "supportFLIntensity") ||
-                       capVer(chn, "whiteLed");
+        // Reolink has shipped several aliases for the same white-LED feature.
+        // supportFLswitch is used by current reolink_aio and appears on firmware
+        // that does not advertise floodLight, so keep the aliases additive.
+        c.floodlight = capVer(chn, "floodLight") || capVer(chn, "supportFLswitch") ||
+                       capVer(chn, "supportFLIntensity") || capVer(chn, "whiteLed");
         c.battery = capVer(chn, "battery") || capVer(chn, "supportBattery");
         c.doorbell = capVer(chn, "supportVisitor") || capVer(chn, "supportDoorbell");
         // supportBalanced only; mainEncType is an encoder flag, NOT a third stream.
@@ -266,6 +269,41 @@ Capabilities parseAbility(const Json &value)
         caps.channels.append(c);
     }
     return caps;
+}
+
+Json getWhiteLed(int channel)
+{
+    // Unlike most Get* calls, Reolink firmware expects action=0 here.  This is
+    // also what current reolink_aio and Scrypted send on real devices.
+    return command(QStringLiteral("GetWhiteLed"), Json{{"channel", channel}}, /*action=*/0);
+}
+
+Json setWhiteLedState(int channel, bool on)
+{
+    // State-only writes are deliberate.  Do not echo mode/brightness/schedule:
+    // toggling a light must not rewrite the user's automation configuration.
+    return command(QStringLiteral("SetWhiteLed"),
+                   Json{{"WhiteLed", {{"channel", channel}, {"state", on ? 1 : 0}}}},
+                   /*action=*/0);
+}
+
+WhiteLedInfo parseWhiteLed(const Json &value, int fallbackChannel)
+{
+    WhiteLedInfo out;
+    const Json wl = jsonObj(value, "WhiteLed");
+    if (wl.empty())
+        return out;
+    out.supported = true;
+    out.channel = jsonInt(wl, "channel", fallbackChannel);
+    const Json &state = jsonRef(wl, "state");
+    if (state.is_boolean()) {
+        out.stateKnown = true;
+        out.on = state.get<bool>();
+    } else if (state.is_number_integer() || state.is_number_unsigned()) {
+        out.stateKnown = true;
+        out.on = state.get<int>() != 0;
+    }
+    return out;
 }
 
 QVector<ChannelInfo> parseChannelStatus(const Json &value)

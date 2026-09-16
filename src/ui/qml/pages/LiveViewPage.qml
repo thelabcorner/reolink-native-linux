@@ -314,6 +314,7 @@ Item {
                     required property bool hasAudio
                     required property bool hasSiren
                     required property bool hasFloodlight
+                    required property bool floodlightOn
                     required property bool hasTalk
                     required property int rotationOverride
 
@@ -341,6 +342,7 @@ Item {
                     capAudio: hasAudio
                     capSiren: hasSiren
                     capFloodlight: hasFloodlight
+                    floodOn: floodlightOn
                     capTalk: hasTalk
                     // idx is the device row: maximizedIndex/selectedIndex track
                     // cameras, not cells, so they survive a rearrange.

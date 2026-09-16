@@ -62,6 +62,7 @@ public:
         HasAudioRole,
         HasSirenRole,
         HasFloodlightRole,
+        FloodlightOnRole,
         HasBatteryRole,
         HasTalkRole,
         IsAdminRole,
@@ -141,7 +142,8 @@ public:
     Q_INVOKABLE QVariantMap hostInfo(qint64 hostId) const;
     // Per-camera summary for the camera properties dialog. Keys: name, hostName,
     // hostId, channel, kind, model, codec, mainSize, subSize, uid, online, isAdmin,
-    // and cap* booleans (ptz/zoom/audio/siren/floodlight/battery/talk).
+    // and cap* booleans (ptz/zoom/audio/siren/floodlight/battery/talk), plus
+    // floodlightOn when the camera reports a current WhiteLed state.
     Q_INVOKABLE QVariantMap cameraInfo(int row) const;
     // Distinct host ids in list order (NVRs and standalone cameras), for grouping.
     Q_INVOKABLE QVariantList hostIds() const;
@@ -191,8 +193,8 @@ public:
     // of cmd -> value) and apply one Set* command (emits settingApplied).
     Q_INVOKABLE void fetchSettings(int row, const QStringList &getCommands);
     Q_INVOKABLE void applySetting(int row, const QString &setCommand, const QVariantMap &param);
-    // Toggle the camera's white-LED / floodlight on<->off. Reads GetWhiteLed first
-    // so only the on/off state flips, leaving brightness and the auto/schedule mode
+    // Toggle the camera's white-LED / spotlight on<->off. Reads GetWhiteLed first,
+    // then writes ONLY {channel,state}, leaving brightness/mode/schedule/AI behavior
     // untouched. Emits settingApplied("SetWhiteLed", ...) for UI feedback.
     Q_INVOKABLE void toggleFloodlight(int row);
     Q_INVOKABLE void reboot(int row);
@@ -292,6 +294,7 @@ private:
         QString password;                           // in-memory only (keyring at rest)
         bool primed = false;                        // password loaded?
         api::ChannelCaps caps;                      // this channel's capabilities
+        int floodlightState = -1;                   // -1 unknown, 0 off, 1 on
         bool talk = false;                          // channel supports two-way audio
         bool isAdmin = false;                       // logged-in user may edit settings
         api::BatteryInfo battery;                   // battery/solar state (if any)
@@ -317,6 +320,7 @@ private:
         QSize subSize;
         QString uid;
         api::ChannelCaps caps;
+        int floodlightState = -1; // -1 unknown, 0 off, 1 on
     };
 
     // Outcome of a worker-thread validation, applied back on the GUI thread.

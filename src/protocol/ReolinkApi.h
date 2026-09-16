@@ -133,6 +133,20 @@ struct Capabilities {
 };
 Capabilities parseAbility(const Json &value);
 
+// ---- Spotlight / white LED -------------------------------------------------
+// Firmware names the visible spotlight/floodlight "WhiteLed".  Capability
+// aliases in GetAbility are inconsistent across generations, so callers may
+// also treat a successful GetWhiteLed response as authoritative support.
+struct WhiteLedInfo {
+    bool supported = false; // a WhiteLed object was returned
+    bool stateKnown = false;
+    bool on = false;
+    int channel = -1;
+};
+Json getWhiteLed(int channel);
+Json setWhiteLedState(int channel, bool on);
+WhiteLedInfo parseWhiteLed(const Json &value, int fallbackChannel = -1);
+
 // ---- Channels (GetChannelstatus, NVR fan-out) -----------------------------
 // An NVR reports its bound cameras here; each online entry becomes a live pane.
 struct ChannelInfo {

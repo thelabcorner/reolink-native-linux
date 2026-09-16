@@ -193,6 +193,43 @@ private slots:
         QVERIFY(caps.channels[1].battery);
     }
 
+    void parseAbilitySpotlightAliases()
+    {
+        const Json value = Json::parse(R"({"Ability":{"abilityChn":[
+            {"supportFLswitch":{"ver":1,"permit":6}}
+        ]}})");
+        const api::Capabilities caps = api::parseAbility(value);
+        QCOMPARE(caps.channels.size(), 1);
+        QVERIFY(caps.channels[0].floodlight);
+    }
+
+    void whiteLedCommandsAndState()
+    {
+        const Json get = api::getWhiteLed(3);
+        QCOMPARE(QString::fromStdString(get.value("cmd", std::string())), QStringLiteral("GetWhiteLed"));
+        QCOMPARE(get.value("action", -1), 0);
+        QCOMPARE(get["param"].value("channel", -1), 3);
+
+        const Json set = api::setWhiteLedState(3, true);
+        QCOMPARE(QString::fromStdString(set.value("cmd", std::string())), QStringLiteral("SetWhiteLed"));
+        QCOMPARE(set.value("action", -1), 0);
+        const Json wl = set["param"]["WhiteLed"];
+        QCOMPARE(wl.value("channel", -1), 3);
+        QCOMPARE(wl.value("state", -1), 1);
+        QCOMPARE(static_cast<int>(wl.size()), 2); // do not rewrite mode/brightness/schedule
+
+        const api::WhiteLedInfo parsed = api::parseWhiteLed(
+            Json{{"WhiteLed", {{"channel", 3}, {"state", 1}, {"bright", 75}}}}, 0);
+        QVERIFY(parsed.supported);
+        QVERIFY(parsed.stateKnown);
+        QVERIFY(parsed.on);
+        QCOMPARE(parsed.channel, 3);
+
+        const api::WhiteLedInfo missing = api::parseWhiteLed(Json::object(), 2);
+        QVERIFY(!missing.supported);
+        QVERIFY(!missing.stateKnown);
+    }
+
     void parseAbilityAdmin()
     {
         const QByteArray adminBody = R"({"Ability":{"userManage":{"ver":1,"permit":6},

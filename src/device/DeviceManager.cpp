@@ -343,6 +343,8 @@ QVariant DeviceManager::data(const QModelIndex &index, int role) const
         return e.caps.siren;
     case HasFloodlightRole:
         return e.caps.floodlight;
+    case FloodlightOnRole:
+        return e.floodlightState == 1;
     case HasBatteryRole:
         return e.caps.battery;
     case HasTalkRole:
@@ -374,6 +376,7 @@ QHash<int, QByteArray> DeviceManager::roleNames() const
         {HasAudioRole, "hasAudio"},
         {HasSirenRole, "hasSiren"},
         {HasFloodlightRole, "hasFloodlight"},
+        {FloodlightOnRole, "floodlightOn"},
         {HasBatteryRole, "hasBattery"},
         {HasTalkRole, "hasTalk"},
         {IsAdminRole, "isAdmin"},
@@ -639,6 +642,7 @@ void DeviceManager::applyValidation(qint64 hostId, const Validation &v)
         e.subSize = ch.subSize;
         e.uid = ch.uid;
         e.caps = ch.caps;
+        e.floodlightState = ch.floodlightState;
         e.talk = ch.caps.talk;
         e.isAdmin = v.isAdmin;
         e.password = v.password;
@@ -718,13 +722,15 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
 
         auto client = std::make_shared<ReolinkHttpClient>(rec.addr, rec.port, rec.https,
                                                           rec.username, password);
-        // Phase 1: device info, ch0 encoding, abilities, battery, and the NVR
-        // channel list.
+        // Phase 1: device info, ch0 encoding, abilities, spotlight state, battery,
+        // and the NVR channel list.  GetWhiteLed is also a capability probe because
+        // several camera firmwares under-report the feature in GetAbility.
         const api::BatchResult b1 = client->call(Json::array({
             api::command(QStringLiteral("GetDevInfo")),
             api::command(QStringLiteral("GetEnc"), Json{{"channel", 0}}, 1),
             api::command(QStringLiteral("GetAbility"),
                          Json{{"User", {{"userName", rec.username.toStdString()}}}}),
+            api::getWhiteLed(0),
             api::command(QStringLiteral("GetBatteryInfo"), Json{{"channel", 0}}),
             api::command(QStringLiteral("GetChannelstatus")),
         }));
@@ -736,6 +742,7 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
         QVector<api::ChannelInfo> channels;
         QString ch0codec = QStringLiteral("h264");
         QSize ch0MainSize, ch0SubSize;
+        api::WhiteLedInfo ch0WhiteLed;
 
         if (b1.transportOk) {
             for (const api::CommandResult &r : b1.results) {
@@ -755,6 +762,8 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
                     ch0SubSize = encStreamSize(enc, "subStream");
                 } else if (r.cmd == QLatin1String("GetAbility") && r.ok) {
                     caps = api::parseAbility(r.value);
+                } else if (r.cmd == QLatin1String("GetWhiteLed") && r.ok) {
+                    ch0WhiteLed = api::parseWhiteLed(r.value, 0);
                 } else if (r.cmd == QLatin1String("GetBatteryInfo") && r.ok) {
                     v.battery = api::parseBatteryInfo(r.value);
                 } else if (r.cmd == QLatin1String("GetChannelstatus") && r.ok) {
@@ -792,6 +801,10 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
             cr.mainSize = ch0MainSize;
             cr.subSize = ch0SubSize;
             cr.caps = capsFor(0);
+            if (ch0WhiteLed.supported)
+                cr.caps.floodlight = true;
+            if (ch0WhiteLed.stateKnown)
+                cr.floodlightState = ch0WhiteLed.on ? 1 : 0;
             v.talk = cr.caps.talk;
             v.channels.append(cr);
         } else {
@@ -805,14 +818,27 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
             QHash<int, QString> codecByChannel;
             QHash<int, QSize> mainSizeByChannel;
             QHash<int, QSize> subSizeByChannel;
+            QHash<int, int> floodlightStateByChannel;
+            QSet<int> floodlightSupported;
+            if (ch0WhiteLed.supported) {
+                floodlightSupported.insert(0);
+                if (ch0WhiteLed.stateKnown)
+                    floodlightStateByChannel[0] = ch0WhiteLed.on ? 1 : 0;
+            }
             if (!online.isEmpty()) {
                 Json encCmds = Json::array();
-                for (const api::ChannelInfo &c : online)
+                for (const api::ChannelInfo &c : online) {
                     encCmds.push_back(
                         api::command(QStringLiteral("GetEnc"), Json{{"channel", c.channel}}, 1));
+                    // ch0 was already probed in phase 1.  Probe every other online
+                    // channel directly so a missing GetAbility alias cannot hide a
+                    // real spotlight control.
+                    if (c.channel != 0)
+                        encCmds.push_back(api::getWhiteLed(c.channel));
+                }
                 const api::BatchResult b2 = client->call(encCmds);
                 if (b2.transportOk)
-                    for (const api::CommandResult &r : b2.results)
+                    for (const api::CommandResult &r : b2.results) {
                         if (r.cmd == QLatin1String("GetEnc") && r.ok) {
                             const Json enc = jsonObj(r.value, "Enc");
                             const int ch = jsonInt(enc, "channel", 0);
@@ -820,7 +846,15 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
                                 jsonStr(jsonObj(enc, "mainStream"), "vType")));
                             mainSizeByChannel[ch] = encStreamSize(enc, "mainStream");
                             subSizeByChannel[ch] = encStreamSize(enc, "subStream");
+                        } else if (r.cmd == QLatin1String("GetWhiteLed") && r.ok) {
+                            const api::WhiteLedInfo wl = api::parseWhiteLed(r.value);
+                            if (wl.supported && wl.channel >= 0) {
+                                floodlightSupported.insert(wl.channel);
+                                if (wl.stateKnown)
+                                    floodlightStateByChannel[wl.channel] = wl.on ? 1 : 0;
+                            }
                         }
+                    }
             }
             for (const api::ChannelInfo &c : online) {
                 ChannelResult cr;
@@ -832,6 +866,9 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
                 cr.subSize = subSizeByChannel.value(c.channel);
                 cr.uid = c.uid;
                 cr.caps = capsFor(c.channel);
+                if (floodlightSupported.contains(c.channel))
+                    cr.caps.floodlight = true;
+                cr.floodlightState = floodlightStateByChannel.value(c.channel, -1);
                 v.talk = v.talk || cr.caps.talk;
                 v.channels.append(cr);
             }
@@ -1442,6 +1479,7 @@ QVariantMap DeviceManager::cameraInfo(int row) const
     m["capAudio"] = e.caps.audio;
     m["capSiren"] = e.caps.siren;
     m["capFloodlight"] = e.caps.floodlight;
+    m["floodlightOn"] = e.floodlightState == 1;
     m["capBattery"] = e.caps.battery;
     m["capTalk"] = e.talk;
     m["rotationOverride"] = e.rotationOverride;
@@ -1483,28 +1521,55 @@ void DeviceManager::toggleFloodlight(int row)
         return;
     }
     const int ch = m_entries.at(row).channel;
-    m_pending.addFuture(QtConcurrent::run([this, client, row, ch, cmd] {
-        // Read the current config so the toggle flips only on/off and leaves the
-        // user's brightness + auto/schedule mode intact.
-        const api::CommandResult got =
-            client->callOne(QStringLiteral("GetWhiteLed"), Json{{"channel", ch}}, /*action=*/1);
+    const qint64 hostId = m_entries.at(row).rec.id;
+    m_pending.addFuture(QtConcurrent::run([this, client, row, ch, hostId, cmd] {
+        // Read the actual state at click time (another client may have changed it).
+        const api::BatchResult getResult = client->call(Json::array({api::getWhiteLed(ch)}));
+        const api::CommandResult got = getResult.results.isEmpty()
+                                           ? api::CommandResult{}
+                                           : getResult.results.first();
         bool ok = false;
         QString error;
+        int newState = -1;
         if (got.ok) {
-            const Json wl = jsonObj(got.value, "WhiteLed");
-            Json set = Json{{"channel", ch}, {"state", jsonInt(wl, "state", 0) ? 0 : 1}};
-            for (const char *k : {"mode", "bright", "LightingSchedule"})
-                if (wl.contains(k))
-                    set[k] = jsonRef(wl, k); // preserve settable fields verbatim
-            const api::CommandResult put =
-                client->callOne(cmd, Json{{"WhiteLed", set}}, /*action=*/0);
-            ok = put.ok;
-            error = ok ? QString() : (put.detail.isEmpty() ? tr("failed") : put.detail);
+            const api::WhiteLedInfo wl = api::parseWhiteLed(got.value, ch);
+            if (!wl.supported || !wl.stateKnown) {
+                error = tr("spotlight state unavailable");
+            } else {
+                newState = wl.on ? 0 : 1;
+                const api::BatchResult setResult =
+                    client->call(Json::array({api::setWhiteLedState(ch, newState == 1)}));
+                const api::CommandResult put = setResult.results.isEmpty()
+                                                   ? api::CommandResult{}
+                                                   : setResult.results.first();
+                ok = setResult.transportOk && put.ok;
+                error = ok ? QString()
+                           : (!put.detail.isEmpty() ? put.detail
+                                                    : (!setResult.error.isEmpty() ? setResult.error
+                                                                                  : tr("failed")));
+            }
         } else {
-            error = got.detail.isEmpty() ? tr("floodlight not supported") : got.detail;
+            error = got.detail.isEmpty() ? tr("spotlight not supported") : got.detail;
         }
         QMetaObject::invokeMethod(
-            this, [this, row, cmd, ok, error] { emit settingApplied(row, cmd, ok, error); },
+            this,
+            [this, row, hostId, ch, cmd, ok, error, newState] {
+                int actualRow = -1;
+                for (int i = 0; i < m_entries.size(); ++i) {
+                    if (m_entries.at(i).rec.id == hostId && m_entries.at(i).channel == ch) {
+                        actualRow = i;
+                        break;
+                    }
+                }
+                if (ok && actualRow >= 0) {
+                    Entry &e = m_entries[actualRow];
+                    e.caps.floodlight = true;
+                    e.floodlightState = newState;
+                    emit dataChanged(index(actualRow), index(actualRow),
+                                     {HasFloodlightRole, FloodlightOnRole});
+                }
+                emit settingApplied(actualRow >= 0 ? actualRow : row, cmd, ok, error);
+            },
             Qt::QueuedConnection);
     }));
 }
