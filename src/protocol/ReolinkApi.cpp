@@ -127,6 +127,7 @@ BatchResult parseBatch(const QByteArray &body)
         if (code == 0) {
             r.ok = true;
             r.value = jsonObj(item, "value");
+            r.range = jsonObj(item, "range");
         } else {
             const Json err = jsonObj(item, "error");
             r.rspCode = jsonInt(err, "rspCode", 0);
@@ -256,11 +257,38 @@ Capabilities parseAbility(const Json &value)
         c.audio = capVer(chn, "supportAudio") || capVer(chn, "supportGop");
         c.talk = capVer(chn, "talk"); // per-channel (verified on RLN8-410)
         c.siren = capVer(chn, "supportAudioAlarm") || capVer(chn, "alarmAudio");
-        // Reolink has shipped several aliases for the same white-LED feature.
-        // supportFLswitch is used by current reolink_aio and appears on firmware
-        // that does not advertise floodLight, so keep the aliases additive.
-        c.floodlight = capVer(chn, "floodLight") || capVer(chn, "supportFLswitch") ||
-                       capVer(chn, "supportFLIntensity") || capVer(chn, "whiteLed");
+        // These historically-named flags all mean "a controllable illumination
+        // light exists". Reolink's official client separately asks for lightType
+        // (Spotlight vs Floodlight); do not collapse the two concepts.
+        c.light = capVer(chn, "floodLight") || capVer(chn, "supportFloodLight")
+                  || capVer(chn, "supportFLswitch") || capVer(chn, "supportFLIntensity")
+                  || capVer(chn, "whiteLed");
+        c.lightBrightness = capVer(chn, "supportFLBrightness")
+                            || capVer(chn, "supportFLIntensity")
+                            || capVer(chn, "supportFloodlightBrightness")
+                            || capVer(chn, "supportFloodlightBrightnessCtrl")
+                            || capVer(chn, "supportFloodlightMultiBrightness");
+        // A device advertising independent brightness control necessarily has a
+        // controllable illumination light even if an older/odd firmware omitted
+        // the usual switch alias.
+        c.light = c.light || c.lightBrightness;
+        // Some HTTP firmwares may expose the same scalar that BCSDK calls
+        // lightType. Only consume an explicit scalar/value; importantly, never
+        // interpret an ability object's `ver` as the type.
+        const Json &lightType = jsonRef(chn, "lightType");
+        if (lightType.is_number_integer() || lightType.is_number_unsigned()) {
+            c.lightType = lightTypeFromInt(lightType.get<int>());
+        } else if (lightType.is_string()) {
+            const QString t = QString::fromStdString(lightType.get<std::string>()).toLower();
+            if (t == QLatin1String("spotlight"))
+                c.lightType = LightType::Spotlight;
+            else if (t == QLatin1String("floodlight"))
+                c.lightType = LightType::Floodlight;
+        } else if (lightType.is_object()) {
+            const Json &v = jsonRef(lightType, "value");
+            if (v.is_number_integer() || v.is_number_unsigned())
+                c.lightType = lightTypeFromInt(v.get<int>());
+        }
         c.battery = capVer(chn, "battery") || capVer(chn, "supportBattery");
         c.doorbell = capVer(chn, "supportVisitor") || capVer(chn, "supportDoorbell");
         // supportBalanced only; mainEncType is an encoder flag, NOT a third stream.
@@ -269,6 +297,35 @@ Capabilities parseAbility(const Json &value)
         caps.channels.append(c);
     }
     return caps;
+}
+
+LightType lightTypeFromInt(int value)
+{
+    switch (value) {
+    case 0: return LightType::Spotlight;
+    case 1: return LightType::Floodlight;
+    default: return LightType::Unknown;
+    }
+}
+
+QString lightTypeKey(LightType type)
+{
+    switch (type) {
+    case LightType::Spotlight: return QStringLiteral("spotlight");
+    case LightType::Floodlight: return QStringLiteral("floodlight");
+    case LightType::Unknown: break;
+    }
+    return QStringLiteral("unknown");
+}
+
+LightType resolvedLightType(bool lightSupported, LightType reportedType)
+{
+    if (!lightSupported)
+        return LightType::Unknown;
+    // Reolink Client 8.20.x initializes a channel's light type as Spotlight and
+    // only promotes it when BCSDK_GetLightType explicitly reports another type.
+    // Keep reportedType raw elsewhere; this function supplies UI compatibility.
+    return reportedType == LightType::Unknown ? LightType::Spotlight : reportedType;
 }
 
 Json getWhiteLed(int channel)
@@ -287,7 +344,21 @@ Json setWhiteLedState(int channel, bool on)
                    /*action=*/0);
 }
 
+Json setWhiteLedBrightness(int channel, int brightness)
+{
+    // Brightness-only write. Do not echo state/mode/schedule: changing intensity
+    // must not rewrite unrelated light automation.
+    return command(QStringLiteral("SetWhiteLed"),
+                   Json{{"WhiteLed", {{"channel", channel}, {"bright", brightness}}}},
+                   /*action=*/0);
+}
+
 WhiteLedInfo parseWhiteLed(const Json &value, int fallbackChannel)
+{
+    return parseWhiteLed(value, Json::object(), fallbackChannel);
+}
+
+WhiteLedInfo parseWhiteLed(const Json &value, const Json &range, int fallbackChannel)
 {
     WhiteLedInfo out;
     const Json wl = jsonObj(value, "WhiteLed");
@@ -295,6 +366,16 @@ WhiteLedInfo parseWhiteLed(const Json &value, int fallbackChannel)
         return out;
     out.supported = true;
     out.channel = jsonInt(wl, "channel", fallbackChannel);
+    const Json &lightType = jsonRef(wl, "lightType");
+    if (lightType.is_number_integer() || lightType.is_number_unsigned())
+        out.type = lightTypeFromInt(lightType.get<int>());
+    else if (lightType.is_string()) {
+        const QString t = QString::fromStdString(lightType.get<std::string>()).toLower();
+        if (t == QLatin1String("spotlight"))
+            out.type = LightType::Spotlight;
+        else if (t == QLatin1String("floodlight"))
+            out.type = LightType::Floodlight;
+    }
     const Json &state = jsonRef(wl, "state");
     if (state.is_boolean()) {
         out.stateKnown = true;
@@ -302,6 +383,18 @@ WhiteLedInfo parseWhiteLed(const Json &value, int fallbackChannel)
     } else if (state.is_number_integer() || state.is_number_unsigned()) {
         out.stateKnown = true;
         out.on = state.get<int>() != 0;
+    }
+    const Json &bright = jsonRef(wl, "bright");
+    if (bright.is_number_integer() || bright.is_number_unsigned()) {
+        out.brightnessSupported = true;
+        out.brightnessKnown = true;
+        out.brightness = bright.get<int>();
+    }
+    const Json brightRange = jsonObj(jsonObj(range, "WhiteLed"), "bright");
+    if (!brightRange.empty()) {
+        out.brightnessSupported = true;
+        out.brightnessMin = jsonInt(brightRange, "min", 0);
+        out.brightnessMax = jsonInt(brightRange, "max", 100);
     }
     return out;
 }

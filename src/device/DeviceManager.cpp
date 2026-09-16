@@ -341,10 +341,14 @@ QVariant DeviceManager::data(const QModelIndex &index, int role) const
         return e.caps.audio;
     case HasSirenRole:
         return e.caps.siren;
-    case HasFloodlightRole:
-        return e.caps.floodlight;
-    case FloodlightOnRole:
-        return e.floodlightState == 1;
+    case HasLightRole:
+        return e.caps.light;
+    case LightOnRole:
+        return e.lightState == 1;
+    case LightTypeRole:
+        return api::lightTypeKey(api::resolvedLightType(e.caps.light, e.caps.lightType));
+    case HasLightBrightnessRole:
+        return e.caps.lightBrightness;
     case HasBatteryRole:
         return e.caps.battery;
     case HasTalkRole:
@@ -375,8 +379,10 @@ QHash<int, QByteArray> DeviceManager::roleNames() const
         {HasZoomRole, "hasZoom"},
         {HasAudioRole, "hasAudio"},
         {HasSirenRole, "hasSiren"},
-        {HasFloodlightRole, "hasFloodlight"},
-        {FloodlightOnRole, "floodlightOn"},
+        {HasLightRole, "hasLight"},
+        {LightOnRole, "lightOn"},
+        {LightTypeRole, "lightType"},
+        {HasLightBrightnessRole, "hasLightBrightness"},
         {HasBatteryRole, "hasBattery"},
         {HasTalkRole, "hasTalk"},
         {IsAdminRole, "isAdmin"},
@@ -642,7 +648,13 @@ void DeviceManager::applyValidation(qint64 hostId, const Validation &v)
         e.subSize = ch.subSize;
         e.uid = ch.uid;
         e.caps = ch.caps;
-        e.floodlightState = ch.floodlightState;
+        e.lightState = ch.lightState;
+        if (e.caps.light)
+            qCDebug(lcProto) << e.rec.addr << "channel" << e.channel
+                             << "controllable light reported type" << api::lightTypeKey(e.caps.lightType)
+                             << "effective type"
+                             << api::lightTypeKey(api::resolvedLightType(e.caps.light, e.caps.lightType))
+                             << "brightness" << e.caps.lightBrightness;
         e.talk = ch.caps.talk;
         e.isAdmin = v.isAdmin;
         e.password = v.password;
@@ -763,7 +775,7 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
                 } else if (r.cmd == QLatin1String("GetAbility") && r.ok) {
                     caps = api::parseAbility(r.value);
                 } else if (r.cmd == QLatin1String("GetWhiteLed") && r.ok) {
-                    ch0WhiteLed = api::parseWhiteLed(r.value, 0);
+                    ch0WhiteLed = api::parseWhiteLed(r.value, r.range, 0);
                 } else if (r.cmd == QLatin1String("GetBatteryInfo") && r.ok) {
                     v.battery = api::parseBatteryInfo(r.value);
                 } else if (r.cmd == QLatin1String("GetChannelstatus") && r.ok) {
@@ -791,6 +803,32 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
             return ch >= 0 && ch < caps.channels.size() ? caps.channels[ch] : api::ChannelCaps{};
         };
 
+        // BCSDK exposes semantic light type separately from the historical
+        // floodlight-named support/control APIs. Treat native cmd 199 as an
+        // independent discovery source, not a fallback gated by HTTP: older and
+        // NVR-proxied firmware can omit the HTTP aliases entirely. Cache the one
+        // native probe per validation so standalone/NVR paths never duplicate it.
+        QHash<int, BaichuanControl::LightAbility> nativeLightsCache;
+        bool nativeLightsRead = false;
+        auto readNativeLights = [&]() {
+            if (nativeLightsRead)
+                return nativeLightsCache;
+            nativeLightsRead = true;
+            BaichuanControl::Params p{rec.addr, 9000, rec.username, password};
+            // Capability discovery must never add multi-second latency to cameras
+            // that expose HTTP normally but have native TCP/9000 disabled. LAN
+            // Baichuan replies are normally near-instant; fail soft and let the
+            // HTTP evidence / legacy Spotlight fallback cover slow edge cases.
+            p.connectTimeoutMs = 300;
+            p.replyTimeoutMs = 700;
+            BaichuanControl bc(p);
+            if (bc.open()) {
+                nativeLightsCache = bc.lightAbilities();
+                bc.close();
+            }
+            return nativeLightsCache;
+        };
+
         if (v.channelNum <= 1) {
             // Standalone camera: a single channel 0.
             ChannelResult cr;
@@ -801,10 +839,21 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
             cr.mainSize = ch0MainSize;
             cr.subSize = ch0SubSize;
             cr.caps = capsFor(0);
-            if (ch0WhiteLed.supported)
-                cr.caps.floodlight = true;
+            if (ch0WhiteLed.supported) {
+                cr.caps.light = true;
+                cr.caps.lightBrightness = cr.caps.lightBrightness || ch0WhiteLed.brightnessSupported;
+                if (ch0WhiteLed.type != api::LightType::Unknown)
+                    cr.caps.lightType = ch0WhiteLed.type;
+            }
             if (ch0WhiteLed.stateKnown)
-                cr.floodlightState = ch0WhiteLed.on ? 1 : 0;
+                cr.lightState = ch0WhiteLed.on ? 1 : 0;
+            const auto nativeLights = readNativeLights();
+            const auto it = nativeLights.constFind(0);
+            if (it != nativeLights.cend()) {
+                cr.caps.light = cr.caps.light || it->supported;
+                if (it->type != api::LightType::Unknown)
+                    cr.caps.lightType = it->type;
+            }
             v.talk = cr.caps.talk;
             v.channels.append(cr);
         } else {
@@ -818,12 +867,18 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
             QHash<int, QString> codecByChannel;
             QHash<int, QSize> mainSizeByChannel;
             QHash<int, QSize> subSizeByChannel;
-            QHash<int, int> floodlightStateByChannel;
-            QSet<int> floodlightSupported;
+            QHash<int, int> lightStateByChannel;
+            QSet<int> lightSupported;
+            QSet<int> lightBrightnessSupported;
+            QHash<int, api::LightType> explicitLightType;
             if (ch0WhiteLed.supported) {
-                floodlightSupported.insert(0);
+                lightSupported.insert(0);
+                if (ch0WhiteLed.brightnessSupported)
+                    lightBrightnessSupported.insert(0);
+                if (ch0WhiteLed.type != api::LightType::Unknown)
+                    explicitLightType[0] = ch0WhiteLed.type;
                 if (ch0WhiteLed.stateKnown)
-                    floodlightStateByChannel[0] = ch0WhiteLed.on ? 1 : 0;
+                    lightStateByChannel[0] = ch0WhiteLed.on ? 1 : 0;
             }
             if (!online.isEmpty()) {
                 Json encCmds = Json::array();
@@ -847,15 +902,21 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
                             mainSizeByChannel[ch] = encStreamSize(enc, "mainStream");
                             subSizeByChannel[ch] = encStreamSize(enc, "subStream");
                         } else if (r.cmd == QLatin1String("GetWhiteLed") && r.ok) {
-                            const api::WhiteLedInfo wl = api::parseWhiteLed(r.value);
+                            const api::WhiteLedInfo wl = api::parseWhiteLed(r.value, r.range, -1);
                             if (wl.supported && wl.channel >= 0) {
-                                floodlightSupported.insert(wl.channel);
+                                lightSupported.insert(wl.channel);
+                                if (wl.brightnessSupported)
+                                    lightBrightnessSupported.insert(wl.channel);
+                                if (wl.type != api::LightType::Unknown)
+                                    explicitLightType[wl.channel] = wl.type;
                                 if (wl.stateKnown)
-                                    floodlightStateByChannel[wl.channel] = wl.on ? 1 : 0;
+                                    lightStateByChannel[wl.channel] = wl.on ? 1 : 0;
                             }
                         }
                     }
             }
+            const auto nativeLights = readNativeLights();
+
             for (const api::ChannelInfo &c : online) {
                 ChannelResult cr;
                 cr.channel = c.channel;
@@ -866,9 +927,19 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
                 cr.subSize = subSizeByChannel.value(c.channel);
                 cr.uid = c.uid;
                 cr.caps = capsFor(c.channel);
-                if (floodlightSupported.contains(c.channel))
-                    cr.caps.floodlight = true;
-                cr.floodlightState = floodlightStateByChannel.value(c.channel, -1);
+                if (lightSupported.contains(c.channel))
+                    cr.caps.light = true;
+                if (lightBrightnessSupported.contains(c.channel))
+                    cr.caps.lightBrightness = true;
+                if (explicitLightType.contains(c.channel))
+                    cr.caps.lightType = explicitLightType.value(c.channel);
+                const auto native = nativeLights.constFind(c.channel);
+                if (native != nativeLights.cend()) {
+                    cr.caps.light = cr.caps.light || native->supported;
+                    if (native->type != api::LightType::Unknown)
+                        cr.caps.lightType = native->type;
+                }
+                cr.lightState = lightStateByChannel.value(c.channel, -1);
                 v.talk = v.talk || cr.caps.talk;
                 v.channels.append(cr);
             }
@@ -1337,7 +1408,10 @@ void DeviceManager::fetchSettings(int row, const QStringList &getCommands)
         auto fetchOne = [&](const QString &cmd) {
             api::CommandResult r;
             for (int attempt = 0; attempt < 3; ++attempt) {
-                r = client->callOne(cmd, Json{{"channel", ch}}, attempt == 1 ? 0 : 1);
+                const int action = cmd == QLatin1String("GetWhiteLed")
+                                       ? 0
+                                       : (attempt == 1 ? 0 : 1);
+                r = client->callOne(cmd, Json{{"channel", ch}}, action);
                 if (r.ok || r.rspCode != 0)
                     break;
                 QThread::msleep(400);
@@ -1357,7 +1431,16 @@ void DeviceManager::fetchSettings(int row, const QStringList &getCommands)
             if (!r.ok && r.rspCode != 0 && v20Alt.contains(c))
                 r = fetchOne(v20Alt.value(c));
             if (r.ok) {
-                values.insert(c, api::toVariant(r.value));
+                // Keep the device's optional range object beside the value. This
+                // is generic rather than WhiteLed-specific and lets every settings
+                // panel honor model/firmware-specific bounds.
+                QVariant value = api::toVariant(r.value);
+                if (!r.range.empty() && value.metaType().id() == QMetaType::QVariantMap) {
+                    QVariantMap map = value.toMap();
+                    map.insert(QStringLiteral("_range"), api::toVariant(r.range));
+                    value = map;
+                }
+                values.insert(c, value);
             } else {
                 failed.append(c);
                 if (!r.detail.isEmpty())
@@ -1478,8 +1561,11 @@ QVariantMap DeviceManager::cameraInfo(int row) const
     m["capZoom"] = e.caps.zoom;
     m["capAudio"] = e.caps.audio;
     m["capSiren"] = e.caps.siren;
-    m["capFloodlight"] = e.caps.floodlight;
-    m["floodlightOn"] = e.floodlightState == 1;
+    m["capLight"] = e.caps.light;
+    m["capLightBrightness"] = e.caps.lightBrightness;
+    m["lightOn"] = e.lightState == 1;
+    m["reportedLightType"] = api::lightTypeKey(e.caps.lightType);
+    m["lightType"] = api::lightTypeKey(api::resolvedLightType(e.caps.light, e.caps.lightType));
     m["capBattery"] = e.caps.battery;
     m["capTalk"] = e.talk;
     m["rotationOverride"] = e.rotationOverride;
@@ -1508,7 +1594,7 @@ QVariantList DeviceManager::hostIds() const
     return ids;
 }
 
-void DeviceManager::toggleFloodlight(int row)
+void DeviceManager::toggleLight(int row)
 {
     const QString cmd = QStringLiteral("SetWhiteLed");
     auto client = clientFor(row);
@@ -1532,9 +1618,9 @@ void DeviceManager::toggleFloodlight(int row)
         QString error;
         int newState = -1;
         if (got.ok) {
-            const api::WhiteLedInfo wl = api::parseWhiteLed(got.value, ch);
+            const api::WhiteLedInfo wl = api::parseWhiteLed(got.value, got.range, ch);
             if (!wl.supported || !wl.stateKnown) {
-                error = tr("spotlight state unavailable");
+                error = tr("light state unavailable");
             } else {
                 newState = wl.on ? 0 : 1;
                 const api::BatchResult setResult =
@@ -1549,7 +1635,7 @@ void DeviceManager::toggleFloodlight(int row)
                                                                                   : tr("failed")));
             }
         } else {
-            error = got.detail.isEmpty() ? tr("spotlight not supported") : got.detail;
+            error = got.detail.isEmpty() ? tr("light not supported") : got.detail;
         }
         QMetaObject::invokeMethod(
             this,
@@ -1563,15 +1649,99 @@ void DeviceManager::toggleFloodlight(int row)
                 }
                 if (ok && actualRow >= 0) {
                     Entry &e = m_entries[actualRow];
-                    e.caps.floodlight = true;
-                    e.floodlightState = newState;
+                    e.caps.light = true;
+                    e.lightState = newState;
                     emit dataChanged(index(actualRow), index(actualRow),
-                                     {HasFloodlightRole, FloodlightOnRole});
+                                     {HasLightRole, LightOnRole, LightTypeRole});
                 }
                 emit settingApplied(actualRow >= 0 ? actualRow : row, cmd, ok, error);
             },
             Qt::QueuedConnection);
     }));
+}
+
+void DeviceManager::setLightBrightness(int row, int brightness)
+{
+    const QString cmd = QStringLiteral("SetLightBrightness");
+    if (row < 0 || row >= m_entries.size()) {
+        emit settingApplied(row, cmd, false, tr("device not ready"));
+        return;
+    }
+    const Entry snapshot = m_entries.at(row);
+    if (!snapshot.isAdmin) {
+        emit settingApplied(row, cmd, false, tr("requires an administrator account"));
+        return;
+    }
+    if (!snapshot.caps.light) {
+        emit settingApplied(row, cmd, false, tr("light not supported"));
+        return;
+    }
+    // The settings UI honors device-reported bounds. Keep the backend free of a
+    // model-specific upper limit; direct callers still reject negative intensity
+    // and the camera validates its own supported maximum.
+    if (brightness < 0) {
+        emit settingApplied(row, cmd, false, tr("brightness must not be negative"));
+        return;
+    }
+
+    auto client = clientFor(row);
+    const int ch = snapshot.channel;
+    const qint64 hostId = snapshot.rec.id;
+    const BaichuanControl::Params p{snapshot.rec.addr, 9000,
+                                    snapshot.rec.username, snapshot.password};
+    m_pending.addFuture(QtConcurrent::run(
+        [this, client, p, row, ch, hostId, brightness, cmd] {
+            bool ok = false;
+            QString error;
+
+            // Reolink Client's classic cross-model path: GET the complete native
+            // FloodlightTask then SET it back with only brightness_cur modified.
+            // requireMatch avoids a false-positive SET on task variants that do
+            // not expose brightness_cur; those fall through to HTTP instead.
+            BaichuanControl bc(p);
+            if (bc.open())
+                ok = bc.writeFields(289, 290, ch,
+                                    {{QStringLiteral("brightness_cur"), brightness}},
+                                    {}, /*requireMatch=*/true);
+            bc.close();
+
+            // Compatibility fallback for devices where the native task is absent,
+            // unavailable behind an NVR, or temporarily blocked by another BC
+            // session. The HTTP write is intentionally partial: channel+bright.
+            if (!ok && client) {
+                const api::BatchResult result =
+                    client->call(Json::array({api::setWhiteLedBrightness(ch, brightness)}));
+                const api::CommandResult put = result.results.isEmpty()
+                                                   ? api::CommandResult{}
+                                                   : result.results.first();
+                ok = result.transportOk && put.ok;
+                if (!ok)
+                    error = !put.detail.isEmpty() ? put.detail
+                            : (!result.error.isEmpty() ? result.error : tr("failed"));
+            }
+            if (!ok && error.isEmpty())
+                error = tr("brightness control not supported");
+
+            QMetaObject::invokeMethod(
+                this,
+                [this, row, hostId, ch, cmd, ok, error] {
+                    int actualRow = row;
+                    for (int i = 0; i < m_entries.size(); ++i) {
+                        if (m_entries.at(i).rec.id == hostId
+                            && m_entries.at(i).channel == ch) {
+                            actualRow = i;
+                            break;
+                        }
+                    }
+                    if (ok && actualRow >= 0 && actualRow < m_entries.size()) {
+                        m_entries[actualRow].caps.lightBrightness = true;
+                        emit dataChanged(index(actualRow), index(actualRow),
+                                         {HasLightBrightnessRole});
+                    }
+                    emit settingApplied(actualRow, cmd, ok, error);
+                },
+                Qt::QueuedConnection);
+        }));
 }
 
 void DeviceManager::reboot(int row)

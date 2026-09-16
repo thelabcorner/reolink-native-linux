@@ -33,6 +33,7 @@ struct CommandResult {
     QString cmd;
     bool ok = false;
     Json value;      // "value" object when ok
+    Json range;      // optional device-reported ranges (e.g. WhiteLed.bright)
     int rspCode = 0; // negative device error when !ok
     QString detail;
 };
@@ -107,6 +108,22 @@ QString snapUrl(const QString &host, int port, bool https, int channel, const QS
 // Per-channel capability flags parsed from Ability.abilityChn[i]. Field names
 // follow reolink_aio; unknown/absent capabilities degrade to false so the UI
 // simply hides the control. Verify against target firmware (DESIGN §6.10).
+//
+// Reolink's own BCSDK models white illumination in two independent dimensions:
+// whether a controllable light exists, and what product/UI type that light is.
+// The transport still uses historical names such as WhiteLed/FloodlightManual for
+// BOTH spotlights and floodlights, so never infer the semantic type from a command
+// or support-flag name alone.
+enum class LightType : int {
+    Unknown = -1,
+    Spotlight = 0,
+    Floodlight = 1,
+};
+
+LightType lightTypeFromInt(int value);
+QString lightTypeKey(LightType type); // "spotlight" | "floodlight" | "unknown"
+LightType resolvedLightType(bool lightSupported, LightType reportedType);
+
 struct ChannelCaps {
     bool ptz = false;
     bool ptzPreset = false;
@@ -119,7 +136,9 @@ struct ChannelCaps {
     bool audio = false;
     bool talk = false; // two-way audio (verified per-channel on real firmware)
     bool siren = false;
-    bool floodlight = false;
+    bool light = false; // controllable WhiteLed subsystem, independent of semantic type
+    LightType lightType = LightType::Unknown;
+    bool lightBrightness = false; // independent brightness-control capability
     bool battery = false;
     bool doorbell = false;
     bool supportsBalanced = false; // exposes a third ("Balanced") stream
@@ -133,19 +152,29 @@ struct Capabilities {
 };
 Capabilities parseAbility(const Json &value);
 
-// ---- Spotlight / white LED -------------------------------------------------
-// Firmware names the visible spotlight/floodlight "WhiteLed".  Capability
-// aliases in GetAbility are inconsistent across generations, so callers may
-// also treat a successful GetWhiteLed response as authoritative support.
+// ---- Controllable white light (spotlight / floodlight) ---------------------
+// HTTP firmware names the shared control surface "WhiteLed" regardless of the
+// physical/UI type. Capability aliases in GetAbility are inconsistent across
+// generations, so callers may also treat a successful GetWhiteLed response as
+// authoritative evidence that a controllable light exists. It is NOT evidence
+// that the light is specifically a floodlight.
 struct WhiteLedInfo {
     bool supported = false; // a WhiteLed object was returned
     bool stateKnown = false;
     bool on = false;
     int channel = -1;
+    LightType type = LightType::Unknown; // only when firmware explicitly reports it
+    bool brightnessSupported = false;
+    bool brightnessKnown = false;
+    int brightness = 0;
+    int brightnessMin = 0;
+    int brightnessMax = 100;
 };
 Json getWhiteLed(int channel);
 Json setWhiteLedState(int channel, bool on);
+Json setWhiteLedBrightness(int channel, int brightness);
 WhiteLedInfo parseWhiteLed(const Json &value, int fallbackChannel = -1);
+WhiteLedInfo parseWhiteLed(const Json &value, const Json &range, int fallbackChannel);
 
 // ---- Channels (GetChannelstatus, NVR fan-out) -----------------------------
 // An NVR reports its bound cameras here; each online entry becomes a live pane.
