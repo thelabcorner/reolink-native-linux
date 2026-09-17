@@ -342,11 +342,11 @@ QVariant DeviceManager::data(const QModelIndex &index, int role) const
     case HasSirenRole:
         return e.caps.siren;
     case HasLightRole:
-        return e.caps.light;
+        return api::hasVisibleLight(e.caps.lightSupport);
     case LightOnRole:
         return e.lightState == 1;
     case LightTypeRole:
-        return api::lightTypeKey(api::resolvedLightType(e.caps.light, e.caps.lightType));
+        return api::lightTypeKey(api::resolvedLightType(e.caps.lightSupport, e.caps.lightType));
     case HasLightBrightnessRole:
         return e.caps.lightBrightness;
     case HasBatteryRole:
@@ -649,12 +649,13 @@ void DeviceManager::applyValidation(qint64 hostId, const Validation &v)
         e.uid = ch.uid;
         e.caps = ch.caps;
         e.lightState = ch.lightState;
-        if (e.caps.light)
-            qCDebug(lcProto) << e.rec.addr << "channel" << e.channel
-                             << "controllable light reported type" << api::lightTypeKey(e.caps.lightType)
-                             << "effective type"
-                             << api::lightTypeKey(api::resolvedLightType(e.caps.light, e.caps.lightType))
-                             << "brightness" << e.caps.lightBrightness;
+        qCDebug(lcProto) << e.rec.addr << "channel" << e.channel
+                         << "visible light support" << api::lightSupportKey(e.caps.lightSupport)
+                         << "reported type" << api::lightTypeKey(e.caps.lightType)
+                         << "effective type"
+                         << api::lightTypeKey(api::resolvedLightType(e.caps.lightSupport,
+                                                                    e.caps.lightType))
+                         << "brightness" << e.caps.lightBrightness;
         e.talk = ch.caps.talk;
         e.isAdmin = v.isAdmin;
         e.password = v.password;
@@ -818,7 +819,8 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
             // Capability discovery must never add multi-second latency to cameras
             // that expose HTTP normally but have native TCP/9000 disabled. LAN
             // Baichuan replies are normally near-instant; fail soft and let the
-            // HTTP evidence / legacy Spotlight fallback cover slow edge cases.
+            // conservative HTTP ability evidence cover slow edge cases. Generic
+            // WhiteLed/type/brightness metadata never promotes Unknown.
             p.connectTimeoutMs = 300;
             p.replyTimeoutMs = 700;
             BaichuanControl bc(p);
@@ -839,20 +841,29 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
             cr.mainSize = ch0MainSize;
             cr.subSize = ch0SubSize;
             cr.caps = capsFor(0);
+            // GetWhiteLed is configuration metadata only. Real RLC-510A firmware
+            // returns a complete WhiteLed object despite having no physical lamp.
             if (ch0WhiteLed.supported) {
-                cr.caps.light = true;
-                cr.caps.lightBrightness = cr.caps.lightBrightness || ch0WhiteLed.brightnessSupported;
                 if (ch0WhiteLed.type != api::LightType::Unknown)
                     cr.caps.lightType = ch0WhiteLed.type;
             }
-            if (ch0WhiteLed.stateKnown)
-                cr.lightState = ch0WhiteLed.on ? 1 : 0;
             const auto nativeLights = readNativeLights();
             const auto it = nativeLights.constFind(0);
             if (it != nativeLights.cend()) {
-                cr.caps.light = cr.caps.light || it->supported;
+                cr.caps.lightSupport =
+                    api::resolvedLightSupport(cr.caps.lightSupport, it->support);
                 if (it->type != api::LightType::Unknown)
                     cr.caps.lightType = it->type;
+            }
+            if (api::hasVisibleLight(cr.caps.lightSupport)) {
+                cr.caps.lightBrightness = cr.caps.lightBrightness || ch0WhiteLed.brightnessSupported;
+                if (ch0WhiteLed.stateKnown)
+                    cr.lightState = ch0WhiteLed.on ? 1 : 0;
+            } else {
+                // Do not publish generic/stale WhiteLed metadata for unsupported or
+                // still-unknown hardware.
+                cr.caps.lightBrightness = false;
+                cr.lightState = -1;
             }
             v.talk = cr.caps.talk;
             v.channels.append(cr);
@@ -868,11 +879,9 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
             QHash<int, QSize> mainSizeByChannel;
             QHash<int, QSize> subSizeByChannel;
             QHash<int, int> lightStateByChannel;
-            QSet<int> lightSupported;
             QSet<int> lightBrightnessSupported;
             QHash<int, api::LightType> explicitLightType;
             if (ch0WhiteLed.supported) {
-                lightSupported.insert(0);
                 if (ch0WhiteLed.brightnessSupported)
                     lightBrightnessSupported.insert(0);
                 if (ch0WhiteLed.type != api::LightType::Unknown)
@@ -904,7 +913,6 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
                         } else if (r.cmd == QLatin1String("GetWhiteLed") && r.ok) {
                             const api::WhiteLedInfo wl = api::parseWhiteLed(r.value, r.range, -1);
                             if (wl.supported && wl.channel >= 0) {
-                                lightSupported.insert(wl.channel);
                                 if (wl.brightnessSupported)
                                     lightBrightnessSupported.insert(wl.channel);
                                 if (wl.type != api::LightType::Unknown)
@@ -927,19 +935,23 @@ void DeviceManager::validateAsync(qint64 hostId, const QString &newPassword, boo
                 cr.subSize = subSizeByChannel.value(c.channel);
                 cr.uid = c.uid;
                 cr.caps = capsFor(c.channel);
-                if (lightSupported.contains(c.channel))
-                    cr.caps.light = true;
-                if (lightBrightnessSupported.contains(c.channel))
-                    cr.caps.lightBrightness = true;
                 if (explicitLightType.contains(c.channel))
                     cr.caps.lightType = explicitLightType.value(c.channel);
                 const auto native = nativeLights.constFind(c.channel);
                 if (native != nativeLights.cend()) {
-                    cr.caps.light = cr.caps.light || native->supported;
+                    cr.caps.lightSupport =
+                        api::resolvedLightSupport(cr.caps.lightSupport, native->support);
                     if (native->type != api::LightType::Unknown)
                         cr.caps.lightType = native->type;
                 }
-                cr.lightState = lightStateByChannel.value(c.channel, -1);
+                if (api::hasVisibleLight(cr.caps.lightSupport)) {
+                    if (lightBrightnessSupported.contains(c.channel))
+                        cr.caps.lightBrightness = true;
+                    cr.lightState = lightStateByChannel.value(c.channel, -1);
+                } else {
+                    cr.caps.lightBrightness = false;
+                    cr.lightState = -1;
+                }
                 v.talk = v.talk || cr.caps.talk;
                 v.channels.append(cr);
             }
@@ -1561,11 +1573,12 @@ QVariantMap DeviceManager::cameraInfo(int row) const
     m["capZoom"] = e.caps.zoom;
     m["capAudio"] = e.caps.audio;
     m["capSiren"] = e.caps.siren;
-    m["capLight"] = e.caps.light;
+    m["capLight"] = api::hasVisibleLight(e.caps.lightSupport);
     m["capLightBrightness"] = e.caps.lightBrightness;
     m["lightOn"] = e.lightState == 1;
     m["reportedLightType"] = api::lightTypeKey(e.caps.lightType);
-    m["lightType"] = api::lightTypeKey(api::resolvedLightType(e.caps.light, e.caps.lightType));
+    m["lightType"] =
+        api::lightTypeKey(api::resolvedLightType(e.caps.lightSupport, e.caps.lightType));
     m["capBattery"] = e.caps.battery;
     m["capTalk"] = e.talk;
     m["rotationOverride"] = e.rotationOverride;
@@ -1597,6 +1610,10 @@ QVariantList DeviceManager::hostIds() const
 void DeviceManager::toggleLight(int row)
 {
     const QString cmd = QStringLiteral("SetWhiteLed");
+    if (row < 0 || row >= m_entries.size()) {
+        emit settingApplied(row, cmd, false, tr("device not ready"));
+        return;
+    }
     auto client = clientFor(row);
     if (!client) {
         emit settingApplied(row, cmd, false, tr("device not ready"));
@@ -1604,6 +1621,10 @@ void DeviceManager::toggleLight(int row)
     }
     if (row < m_entries.size() && !m_entries.at(row).isAdmin) {
         emit settingApplied(row, cmd, false, tr("requires an administrator account"));
+        return;
+    }
+    if (!api::hasVisibleLight(m_entries.at(row).caps.lightSupport)) {
+        emit settingApplied(row, cmd, false, tr("visible light not supported"));
         return;
     }
     const int ch = m_entries.at(row).channel;
@@ -1649,10 +1670,9 @@ void DeviceManager::toggleLight(int row)
                 }
                 if (ok && actualRow >= 0) {
                     Entry &e = m_entries[actualRow];
-                    e.caps.light = true;
                     e.lightState = newState;
                     emit dataChanged(index(actualRow), index(actualRow),
-                                     {HasLightRole, LightOnRole, LightTypeRole});
+                                     {LightOnRole});
                 }
                 emit settingApplied(actualRow >= 0 ? actualRow : row, cmd, ok, error);
             },
@@ -1672,7 +1692,7 @@ void DeviceManager::setLightBrightness(int row, int brightness)
         emit settingApplied(row, cmd, false, tr("requires an administrator account"));
         return;
     }
-    if (!snapshot.caps.light) {
+    if (!api::hasVisibleLight(snapshot.caps.lightSupport)) {
         emit settingApplied(row, cmd, false, tr("light not supported"));
         return;
     }

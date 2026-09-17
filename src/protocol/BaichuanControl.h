@@ -60,15 +60,16 @@ public:
     bool writeEnable(quint32 getCmdId, quint32 setCmdId, int channel, bool enable);
 
     struct LightAbility {
-        bool supported = false;
+        api::LightSupport support = api::LightSupport::Unknown;
         api::LightType type = api::LightType::Unknown;
     };
 
     // Parse the native Baichuan cmd-199 capability document. Reolink's official
     // BCSDK exposes light support and BC_LIGHT_TYPE_* independently; cmd 199 is
     // the open wire-level capability source also used by reolink_aio. `ledCtrl`
-    // bits 1+2 identify the controllable light subsystem; `lightType`, when
-    // present, identifies Spotlight(0) vs Floodlight(1).
+    // bits 1+2 identify the controllable light subsystem. A present ledCtrl with
+    // those bits clear is an explicit Unsupported result, not Unknown. `lightType`
+    // is classification metadata only and does not imply that a lamp exists.
     static QHash<int, LightAbility> parseLightAbilities(const QByteArray &xml);
     QHash<int, LightAbility> lightAbilities();
 

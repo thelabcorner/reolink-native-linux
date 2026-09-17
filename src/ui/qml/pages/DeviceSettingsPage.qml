@@ -419,7 +419,9 @@ Item {
             readonly property var http: page.val("GetWhiteLed", "WhiteLed") || ({})
             readonly property var httpRange: page.val("GetWhiteLed", "_range", "WhiteLed", "bright") || ({})
             readonly property string lightName: page.camera.lightType === "floodlight"
-                                                    ? qsTr("Floodlight") : qsTr("Spotlight")
+                                                    ? qsTr("Floodlight")
+                                                  : page.camera.lightType === "spotlight"
+                                                    ? qsTr("Spotlight") : qsTr("Light")
             readonly property bool lightChecked: http.state !== undefined
                                                        ? parseInt(http.state) !== 0
                                                        : page.camera.lightOn === true

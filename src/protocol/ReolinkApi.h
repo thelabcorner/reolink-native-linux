@@ -106,8 +106,9 @@ QString snapUrl(const QString &host, int port, bool https, int channel, const QS
 
 // ---- Capabilities (GetAbility) --------------------------------------------
 // Per-channel capability flags parsed from Ability.abilityChn[i]. Field names
-// follow reolink_aio; unknown/absent capabilities degrade to false so the UI
-// simply hides the control. Verify against target firmware (DESIGN §6.10).
+// follow reolink_aio. Physical visible-light support is tri-state because older
+// firmware frequently exposes generic WhiteLed configuration even when no lamp
+// exists. Unknown must never be promoted to Supported by such weak metadata.
 //
 // Reolink's own BCSDK models white illumination in two independent dimensions:
 // whether a controllable light exists, and what product/UI type that light is.
@@ -120,9 +121,21 @@ enum class LightType : int {
     Floodlight = 1,
 };
 
+enum class LightSupport : int {
+    Unknown = -1,
+    Unsupported = 0,
+    Supported = 1,
+};
+
 LightType lightTypeFromInt(int value);
 QString lightTypeKey(LightType type); // "spotlight" | "floodlight" | "unknown"
-LightType resolvedLightType(bool lightSupported, LightType reportedType);
+QString lightSupportKey(LightSupport support); // "supported" | "unsupported" | "unknown"
+// Native cmd-199 `ledCtrl` is the strongest physical-hardware signal. When it is
+// unavailable, fall back to explicit HTTP GetAbility switch support. Endpoint
+// existence, brightness metadata and lightType are intentionally not inputs.
+LightSupport resolvedLightSupport(LightSupport httpSupport, LightSupport nativeSupport);
+LightType resolvedLightType(LightSupport support, LightType reportedType);
+inline bool hasVisibleLight(LightSupport support) { return support == LightSupport::Supported; }
 
 struct ChannelCaps {
     bool ptz = false;
@@ -136,9 +149,9 @@ struct ChannelCaps {
     bool audio = false;
     bool talk = false; // two-way audio (verified per-channel on real firmware)
     bool siren = false;
-    bool light = false; // controllable WhiteLed subsystem, independent of semantic type
+    LightSupport lightSupport = LightSupport::Unknown; // physical visible illuminator support
     LightType lightType = LightType::Unknown;
-    bool lightBrightness = false; // independent brightness-control capability
+    bool lightBrightness = false; // valid for UI only when lightSupport is Supported
     bool battery = false;
     bool doorbell = false;
     bool supportsBalanced = false; // exposes a third ("Balanced") stream
@@ -154,10 +167,10 @@ Capabilities parseAbility(const Json &value);
 
 // ---- Controllable white light (spotlight / floodlight) ---------------------
 // HTTP firmware names the shared control surface "WhiteLed" regardless of the
-// physical/UI type. Capability aliases in GetAbility are inconsistent across
-// generations, so callers may also treat a successful GetWhiteLed response as
-// authoritative evidence that a controllable light exists. It is NOT evidence
-// that the light is specifically a floodlight.
+// physical/UI type. Critically, successful GetWhiteLed is NOT physical capability
+// evidence: RLC-510A firmware without any visible lamp still returns a complete
+// WhiteLed object, brightness range, schedule and state. Use it only as metadata
+// after visible-light support has been established independently.
 struct WhiteLedInfo {
     bool supported = false; // a WhiteLed object was returned
     bool stateKnown = false;

@@ -2,6 +2,8 @@
 
 #include <QUrl>
 
+#include <initializer_list>
+
 namespace rl {
 namespace api {
 
@@ -226,6 +228,20 @@ static bool capVer(const Json &chn, const char *key)
     return false;
 }
 
+static LightSupport capSupport(const Json &chn, std::initializer_list<const char *> keys)
+{
+    bool seen = false;
+    for (const char *key : keys) {
+        const Json &v = jsonRef(chn, key);
+        if (v.is_null())
+            continue;
+        seen = true;
+        if (capVer(chn, key))
+            return LightSupport::Supported;
+    }
+    return seen ? LightSupport::Unsupported : LightSupport::Unknown;
+}
+
 Capabilities parseAbility(const Json &value)
 {
     Capabilities caps;
@@ -257,21 +273,15 @@ Capabilities parseAbility(const Json &value)
         c.audio = capVer(chn, "supportAudio") || capVer(chn, "supportGop");
         c.talk = capVer(chn, "talk"); // per-channel (verified on RLN8-410)
         c.siren = capVer(chn, "supportAudioAlarm") || capVer(chn, "alarmAudio");
-        // These historically-named flags all mean "a controllable illumination
-        // light exists". Reolink's official client separately asks for lightType
-        // (Spotlight vs Floodlight); do not collapse the two concepts.
-        c.light = capVer(chn, "floodLight") || capVer(chn, "supportFloodLight")
-                  || capVer(chn, "supportFLswitch") || capVer(chn, "supportFLIntensity")
-                  || capVer(chn, "whiteLed");
+        // Only explicit switch/existence abilities establish physical visible
+        // illumination over HTTP. Intensity/brightness aliases are metadata, not
+        // existence signals (and generic WhiteLed config is even less reliable).
+        c.lightSupport = capSupport(chn, {"floodLight", "supportFloodLight", "supportFLswitch"});
         c.lightBrightness = capVer(chn, "supportFLBrightness")
                             || capVer(chn, "supportFLIntensity")
                             || capVer(chn, "supportFloodlightBrightness")
                             || capVer(chn, "supportFloodlightBrightnessCtrl")
                             || capVer(chn, "supportFloodlightMultiBrightness");
-        // A device advertising independent brightness control necessarily has a
-        // controllable illumination light even if an older/odd firmware omitted
-        // the usual switch alias.
-        c.light = c.light || c.lightBrightness;
         // Some HTTP firmwares may expose the same scalar that BCSDK calls
         // lightType. Only consume an explicit scalar/value; importantly, never
         // interpret an ability object's `ver` as the type.
@@ -318,14 +328,29 @@ QString lightTypeKey(LightType type)
     return QStringLiteral("unknown");
 }
 
-LightType resolvedLightType(bool lightSupported, LightType reportedType)
+QString lightSupportKey(LightSupport support)
 {
-    if (!lightSupported)
-        return LightType::Unknown;
-    // Reolink Client 8.20.x initializes a channel's light type as Spotlight and
-    // only promotes it when BCSDK_GetLightType explicitly reports another type.
-    // Keep reportedType raw elsewhere; this function supplies UI compatibility.
-    return reportedType == LightType::Unknown ? LightType::Spotlight : reportedType;
+    switch (support) {
+    case LightSupport::Supported: return QStringLiteral("supported");
+    case LightSupport::Unsupported: return QStringLiteral("unsupported");
+    case LightSupport::Unknown: break;
+    }
+    return QStringLiteral("unknown");
+}
+
+LightSupport resolvedLightSupport(LightSupport httpSupport, LightSupport nativeSupport)
+{
+    // cmd-199 ledCtrl is a native per-channel physical-capability bitmap and is
+    // therefore authoritative when present. HTTP GetAbility is the conservative
+    // fallback when native capability discovery is unavailable.
+    return nativeSupport != LightSupport::Unknown ? nativeSupport : httpSupport;
+}
+
+LightType resolvedLightType(LightSupport support, LightType reportedType)
+{
+    // Type describes a lamp; it does not prove one exists. Some RLC-510A firmware
+    // reports lightType=0 (Spotlight) while ledCtrl=0 and no lamp is fitted.
+    return hasVisibleLight(support) ? reportedType : LightType::Unknown;
 }
 
 Json getWhiteLed(int channel)

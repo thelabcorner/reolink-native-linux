@@ -328,11 +328,15 @@ BaichuanControl::parseLightAbilities(const QByteArray &xml)
                 continue;
             LightAbility &ability = out[ctx.channel];
             // reolink_aio's clean-room cmd-199 analysis: ledCtrl bit 1 AND bit 2
-            // are the white-light capability. Preserve support discovered from a
-            // sibling/outer item instead of overwriting it with false.
-            if (ctx.ledCtrl >= 0)
-                ability.supported = ability.supported
-                                    || (((ctx.ledCtrl >> 1) & 1) && ((ctx.ledCtrl >> 2) & 1));
+            // are the white-light capability. Preserve a positive sibling record;
+            // otherwise an explicit ledCtrl value is a trustworthy negative.
+            if (ctx.ledCtrl >= 0) {
+                const bool supported = ((ctx.ledCtrl >> 1) & 1) && ((ctx.ledCtrl >> 2) & 1);
+                if (supported)
+                    ability.support = api::LightSupport::Supported;
+                else if (ability.support == api::LightSupport::Unknown)
+                    ability.support = api::LightSupport::Unsupported;
+            }
             if (ctx.typeExplicit && ctx.type != api::LightType::Unknown)
                 ability.type = ctx.type;
         }

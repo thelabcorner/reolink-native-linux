@@ -145,7 +145,8 @@ public:
     // Per-camera summary for the camera properties dialog. Keys: name, hostName,
     // hostId, channel, kind, model, codec, mainSize, subSize, uid, online, isAdmin,
     // and cap* booleans (ptz/zoom/audio/siren/light/lightBrightness/battery/talk),
-    // plus lightOn, effective lightType, and reportedLightType.
+    // plus lightOn, effective lightType, and raw reportedLightType. capLight is
+    // true only for positively established physical visible illumination.
     Q_INVOKABLE QVariantMap cameraInfo(int row) const;
     // Distinct host ids in list order (NVRs and standalone cameras), for grouping.
     Q_INVOKABLE QVariantList hostIds() const;
@@ -195,9 +196,10 @@ public:
     // of cmd -> value) and apply one Set* command (emits settingApplied).
     Q_INVOKABLE void fetchSettings(int row, const QStringList &getCommands);
     Q_INVOKABLE void applySetting(int row, const QString &setCommand, const QVariantMap &param);
-    // Toggle the camera's controllable white light on<->off. Reads GetWhiteLed first,
-    // then writes ONLY {channel,state}, leaving brightness/mode/schedule/AI behavior
-    // untouched. Emits settingApplied("SetWhiteLed", ...) for UI feedback.
+    // Toggle a positively-capable camera's controllable visible light on<->off.
+    // Reads GetWhiteLed first, then writes ONLY {channel,state}, leaving
+    // brightness/mode/schedule/AI behavior untouched. Generic GetWhiteLed support
+    // alone never authorizes this write.
     Q_INVOKABLE void toggleLight(int row);
     // Change illumination intensity without rewriting on/off state, mode,
     // schedules, or AI-trigger configuration. Native Baichuan task RMW first,

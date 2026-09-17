@@ -373,7 +373,7 @@ Run at Startup, Automatic Client Update, Add Device Automatically, Auto Live Vie
 
 ### 6.10 Capability and permission gating (drives which controls exist — and which are enabled)
 
-Query `GetAbility` (per-user) + `GetChnTypeInfo`/`GetChannelstatus` + `GetEnc` ranges (`action=1`) at connect and show/hide accordingly: **PTZ vs fixed**, **AI (person/vehicle/pet) vs basic motion**, **audio present**, **controllable light / light type / light brightness as separate dimensions**, **siren**, **battery vs mains**, **doorbell**, **fisheye**, and **Balanced** (present only when a third stream is advertised — otherwise only Clear + Fluent, matching the official client's per-camera behavior). For light semantics, raw `Unknown` is preserved internally; a supported legacy light with no explicit type resolves to Spotlight for UI compatibility, while Floodlight requires an explicit Floodlight type.
+Query `GetAbility` (per-user) + `GetChnTypeInfo`/`GetChannelstatus` + `GetEnc` ranges (`action=1`) at connect and show/hide accordingly: **PTZ vs fixed**, **AI (person/vehicle/pet) vs basic motion**, **audio present**, **controllable visible light / light type / light brightness as separate dimensions**, **siren**, **battery vs mains**, **doorbell**, **fisheye**, and **Balanced** (present only when a third stream is advertised — otherwise only Clear + Fluent, matching the official client's per-camera behavior). Visible-light existence is tri-state (`Unknown`, `Unsupported`, `Supported`). Native Baichuan cmd 199 `ledCtrl` is authoritative when present; HTTP `floodLight`/`supportFLswitch` abilities are the conservative fallback. A successful `GetWhiteLed`, brightness metadata, IR/status-LED support, or `lightType` never promotes existence. Unknown stays hidden until positively supported, and a supported light with unknown type is labeled generically as **Light** rather than guessed Spotlight/Floodlight.
 
 **Sub-user / restricted accounts:** every privileged control binds to a unified **capability/permission model** resolved from `GetAbility` *for the logged-in user* combined with the account's user level (Admin vs User). A restricted login sees the same layout as an admin, but privileged controls (settings writes, PTZ where denied, format, firmware, user management, reboot) render **disabled with a tooltip** ("requires administrator account on this device") rather than hidden — matching the official client and keeping the UI stable across account types. The permission model is the single source of truth; no control ships with an ad-hoc `isAdmin` check.
 
@@ -387,7 +387,7 @@ Query `GetAbility` (per-user) + `GetChnTypeInfo`/`GetChannelstatus` + `GetEnc` r
 Host        { id, kind(Camera|NVR), addr(ip|uid), port, https,
               credentialsRef, deviceInfo, ability, userLevel, leaseTime, lastSeen }
 Channel     { hostId, index(0-based), name, model, online,
-              capabilities{ptz,ai,audio,battery,doorbell,fisheye,siren,light,lightType,lightBrightness,
+              capabilities{ptz,ai,audio,battery,doorbell,fisheye,siren,lightSupport,lightType,lightBrightness,
                            streams[main,balanced?,sub]},
               batteryState{percent,charging,solar}? }
 StreamProfile { channelId, kind(main|balanced|sub), codec, res, fps, bitrate }
